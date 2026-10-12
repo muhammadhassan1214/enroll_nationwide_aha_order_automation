@@ -59,4 +59,4 @@ There is no automatic purchasing: when stock is short the order waits and Discor
    ENW_COMPLETION_MESSAGE="..."   # text added to the email the instructor receives
    ```
 
-3. Run `run.bat`.
+3. Run `start_automation.bat`.
