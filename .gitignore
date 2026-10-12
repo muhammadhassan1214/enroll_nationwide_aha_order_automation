@@ -1,0 +1,11 @@
+venv
+Utils/chrome-dir
+.idea
+__pycache__
+.env
+logs
+failed_orders.csv
+eBook_available_codes.xlsx
+_backup_before_enrollnationwide_20261012_0041
+data
+.venv
