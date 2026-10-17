@@ -222,8 +222,18 @@ def assign_to_instructor(driver, name: str, quantity: str, product_code: str) ->
     return False
 
 
-def assign_to_training_center(driver, name: str, quantity: str, product_code: str, training_site: str) -> bool:
-    """Assign to training center with comprehensive error handling."""
+def assign_to_training_center(driver, name: str, quantity: str, product_code: str, training_site: str,
+                              result: Optional[dict] = None) -> bool:
+    """Assign to training center with comprehensive error handling.
+
+    For 'Code Blue CPR Services, LLC' (TS68082) this is the full Code Blue flow:
+      1. assign from the main account to the Code Blue training site
+      2-3. log out, log into the Code Blue account (AHA_NEW_USERNAME / AHA_NEW_PASSWORD)
+      4. assign the eCards from the Code Blue account to the instructor
+      5-6. log out and log back into the main account
+    If a `result` dict is passed, 'site_assigned' is set after step 1 and the Code Blue
+    step fills in its own keys (see assign_from_code_blue_account).
+    """
     if not available_courses:
         logger.error("Available courses not initialized")
         return False
@@ -277,8 +287,11 @@ def assign_to_training_center(driver, name: str, quantity: str, product_code: st
             time.sleep(2)
             return True
 
+        if result is not None:
+            result["site_assigned"] = True
         logger.info(f"Assigned {quantity} of {product_code} to training site {training_site}; continuing as the Code Blue account")
-        return assign_from_code_blue_account(driver, name, quantity, product_code, training_site, available_course_selector)
+        return assign_from_code_blue_account(driver, name, quantity, product_code, training_site,
+                                             available_course_selector, result=result)
 
     except Exception as e:
         logger.error(f"Training site assignment failed: {e}")
@@ -287,15 +300,32 @@ def assign_to_training_center(driver, name: str, quantity: str, product_code: st
 
 
 def assign_from_code_blue_account(driver, name: str, quantity: str, product_code: str, training_site: str,
-                                  available_course_selector: str) -> bool:
+                                  available_course_selector: str, result: Optional[dict] = None) -> bool:
     """Code Blue: log in as the Code Blue account and assign the cards on to the instructor.
-    Always logs back into the main (Atlas) account afterwards, even if a step fails."""
+    Always logs back into the main (Atlas) account afterwards, even if a step fails.
+
+    If a `result` dict is passed it is filled with:
+      before / after – Code Blue account stock of the product before and after the assignment
+      short          – True if the Code Blue account doesn't have enough stock (nothing assigned)
+      committed      – True once Confirm was clicked (cards may have been issued from here on)
+    """
     try:
         logout_from_aha(driver)
         safe_navigate_to_url(driver, QuickLinks.ecards_inventory)
         if not login_to_ecards(driver, username=os.getenv("AHA_NEW_USERNAME"), password=os.getenv("AHA_NEW_PASSWORD")):
             logger.error("Could not log into the Code Blue eCards account")
             return False
+
+        if result is not None:
+            # Stock in the Code Blue account (also opens the inventory page for the next click)
+            result["before"] = get_inventory_quantity(driver, product_code)
+            if result["before"] is None:
+                logger.error(f"Could not read Code Blue account stock for {product_code}")
+                return False
+            if result["before"] < int(quantity):
+                logger.error(f"Code Blue account has {result['before']} of {product_code}, need {quantity}")
+                result["short"] = True
+                return False
 
         if not click_element_by_js(driver, (By.XPATH, available_course_selector)):
             return False
@@ -355,6 +385,8 @@ def assign_from_code_blue_account(driver, name: str, quantity: str, product_code
         time.sleep(1)
 
         # Click confirm
+        if result is not None:
+            result["committed"] = True
         if not click_element_by_js(driver, AssignToInstructorPage.continue_button):
             return False
 
@@ -363,6 +395,9 @@ def assign_from_code_blue_account(driver, name: str, quantity: str, product_code
         # Click complete and confirm eCards accepted it
         if not finish_assignment(driver):
             return False
+
+        if result is not None:
+            result["after"] = get_inventory_quantity(driver, product_code)
 
         logger.info(f"Successfully assigned {quantity} of {product_code} to instructor {name} from the Code Blue account")
         return True

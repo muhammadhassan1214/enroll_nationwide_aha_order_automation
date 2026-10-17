@@ -51,6 +51,8 @@ class EnrollNationwideOrderPage:
     order_details = (By.CSS_SELECTOR, "article.cbp-cs-detail")
     # orders with a "Certificates" section are skipped
     certificates_heading = (By.XPATH, "//h2[contains(text(), 'Certificates')]")
+    # orders whose training site is Code Blue CPR Services are assigned from the Code Blue eCards account
+    training_site_name = (By.XPATH, "//p[text()= 'Training site: ']/child::strong")
     ordered_by_box = (By.XPATH, "//article[contains(@class, 'cbp-cs-detail')]//h3[text()= 'Ordered by' or text()= 'Instructor']/parent::div")
     ordered_by_names = (By.XPATH, "./p/strong")
     # rows of the items grid, header and total rows have extra classes

@@ -8,7 +8,7 @@ from courses import AvailableCourses
 from discord_notification import DiscordNotifier, generate_stock_message
 from Utils.functions import get_training_site_name, validate_environment_variables
 from Utils.orderLedger import OrderLedger, ProcessedOrders
-from Utils.pageSelectors import QuickLinks, EnrollNationwideOrderPage
+from Utils.pageSelectors import QuickLinks, EnrollNationwideOrderPage, AHAInventoryPage
 from Utils.utils import get_undetected_driver, safe_navigate_to_url
 
 from Utils.codeBlueFunctions import (
@@ -20,8 +20,16 @@ from Utils.codeBlueFunctions import (
 from Utils.ahaFunctions import (
     login_to_ecards, assign_to_instructor,
     assign_to_training_center, assign_to_admin_instructor,
-    get_stock_info, get_inventory_quantity, is_ecards_under_maintenance
+    get_stock_info, get_inventory_quantity, is_ecards_under_maintenance,
+    assign_from_code_blue_account
 )
+
+# Code Blue CPR Services orders (training site TS68082 in data/training_sites.csv):
+# assign from the main account to the Code Blue site, then from the Code Blue account
+# to the instructor (see assign_to_training_center in ahaFunctions.py).
+CODE_BLUE_SITE_CODE = "TS68082"
+CODE_BLUE_SITE_TEXT = "code blue cpr services"
+CODE_BLUE_ECARDS_SITE = get_training_site_name(CODE_BLUE_SITE_CODE) or "Code Blue CPR Services, LLC"
 
 
 last_message = ""
@@ -75,6 +83,7 @@ class OrderProcessor:
         self.ledger = OrderLedger()
         self.processed_orders = ProcessedOrders()
         self.skip_reason = ""   # why the last order was skipped (saved in processed_orders.json)
+        self.current_order_name = ""
         self.ecards_tab = None
         self.enw_tab = None
         self.results = {"completed": [], "skipped": [], "failed": [], "short": [], "review": [], "dry-run": [], "waiting": []}
@@ -219,7 +228,99 @@ class OrderProcessor:
 
         return True
 
-    def assign_line(self, order: Dict[str, Any], training_site: str) -> str:
+    def assign_line_code_blue(self, order: Dict[str, Any]) -> str:
+        """
+        Full Code Blue flow for one line:
+        main account -> Code Blue CPR Services site, then Code Blue account -> instructor,
+        then back to the main account. Both halves are validated by stock.
+        Returns done / failed / unverified, or 'transferred' when the cards reached the
+        Code Blue account but the instructor step didn't happen (next run only redoes that step).
+        """
+        product_code = order.get('product_code', '')
+        name = order.get('name', '')
+        quantity = int(order.get('quantity', 0))
+
+        # Main account stock before step 1
+        before_main = get_inventory_quantity(self.driver, product_code)
+        if before_main is None:
+            logger.error(f"Could not read eCards stock for {product_code}")
+            return "failed"
+        if before_main < quantity:
+            logger.error(f"Live stock for {product_code} is {before_main}, need {quantity}")
+            quantity_required.append({"sku": product_code, "qty": quantity - before_main, "required_qty": quantity,
+                                      "available_qty": before_main, "order_name": self.current_order_name})
+            return "failed"
+
+        logger.info(f"Code Blue order: assigning {quantity} x {product_code} to {CODE_BLUE_ECARDS_SITE}, "
+                    f"then from the Code Blue account to {name}")
+        result = {}
+        ok = assign_to_training_center(self.driver, name, str(quantity), product_code,
+                                       CODE_BLUE_ECARDS_SITE, result=result)
+
+        # Step 1 check: main account stock must have dropped by the quantity
+        # (assign_to_training_center always logs back into the main account at the end)
+        if not self.setup_eCards_session():
+            logger.error("Could not get back into the main eCards account to validate")
+            return "unverified"
+        after_main = get_inventory_quantity(self.driver, product_code)
+        if after_main is not None:
+            self.stock_info[product_code] = after_main
+        transferred = after_main is not None and before_main - after_main == quantity
+
+        if not transferred:
+            if not ok and after_main == before_main and not result.get("site_assigned"):
+                logger.error(f"✗ {product_code} was not assigned to {CODE_BLUE_ECARDS_SITE} (stock unchanged at {before_main})")
+                return "failed"
+            logger.error(f"? {product_code}: could not confirm the transfer to {CODE_BLUE_ECARDS_SITE} "
+                         f"(main stock {before_main} -> {after_main})")
+            return "unverified"
+
+        logger.info(f"✓ Step 1 validated: main stock {before_main} -> {after_main}")
+
+        # Step 4 check: Code Blue account stock must have dropped by the quantity
+        cb_before, cb_after = result.get("before"), result.get("after")
+        if ok and cb_before is not None and cb_after is not None and cb_before - cb_after == quantity:
+            logger.info(f"✓ Step 4 validated: Code Blue account stock {cb_before} -> {cb_after}")
+            return "done"
+        if not result.get("committed"):
+            logger.error(f"{product_code}: cards are in the Code Blue account but were not assigned to {name}; "
+                         f"next run will only do the Code Blue step")
+            return "transferred"
+        logger.error(f"? {product_code}: could not confirm the Code Blue assignment "
+                     f"(success={ok}, Code Blue stock {cb_before} -> {cb_after})")
+        return "unverified"
+
+    def assign_line_from_code_blue(self, order: Dict[str, Any]) -> str:
+        """Only the Code Blue part (steps 2-6) for a line whose cards were already moved to the
+        Code Blue site in an earlier run. Validated against the Code Blue account's stock."""
+        product_code = order.get('product_code', '')
+        name = order.get('name', '')
+        quantity = int(order.get('quantity', 0))
+        course_selector = f"{AHAInventoryPage.available_course_selector(product_code)}[@role='button']"
+
+        logger.info(f"Resuming Code Blue order: assigning {quantity} x {product_code} "
+                    f"to {name} from the Code Blue account")
+        result = {}
+        ok = assign_from_code_blue_account(self.driver, name, str(quantity), product_code,
+                                           CODE_BLUE_ECARDS_SITE, course_selector, result=result)
+        before, after = result.get("before"), result.get("after")
+
+        if ok and before is not None and after is not None and before - after == quantity:
+            logger.info(f"✓ Validated {product_code} (Code Blue account): stock {before} -> {after}")
+            return "done"
+        if not ok and result.get("short"):
+            quantity_required.append({"sku": f"{product_code} (Code Blue account)", "qty": quantity - before,
+                                      "required_qty": quantity, "available_qty": before,
+                                      "order_name": self.current_order_name})
+            return "failed"
+        if not ok and not result.get("committed"):
+            logger.error(f"✗ {product_code} was not assigned from the Code Blue account (stopped before Confirm)")
+            return "failed"
+        logger.error(f"? {product_code}: could not confirm the Code Blue assignment "
+                     f"(success={ok}, stock {before} -> {after})")
+        return "unverified"
+
+    def assign_line(self, order: Dict[str, Any], training_site: str, code_blue: bool = False) -> str:
         """
         Assign one order line on eCards and validate it.
         Returns 'done', 'failed' (nothing was issued) or 'unverified' (eCards may have
@@ -229,6 +330,10 @@ class OrderProcessor:
         course_name = order.get('course_name', '')
         name = order.get('name', '')
         quantity = int(order.get('quantity', 0))
+
+        # Code Blue orders (ACLS/PALS keep using the Admin Instructor flow below)
+        if code_blue and not is_acls_pals_course(course_name):
+            return self.assign_line_code_blue(order)
 
         # ACLS/PALS go to the Admin Instructor; that flow has its own stock count,
         # so the validation is eCards' confirmation page (checked in finish_assignment)
@@ -247,7 +352,7 @@ class OrderProcessor:
         if before < quantity:
             logger.error(f"Live stock for {product_code} is {before}, need {quantity}")
             quantity_required.append({"sku": product_code, "qty": quantity - before, "required_qty": quantity,
-                                      "available_qty": before, "order_name": order.get("order_name", "")})
+                                      "available_qty": before, "order_name": self.current_order_name})
             return "failed"
 
         # Same assignment rules as before
@@ -306,6 +411,16 @@ class OrderProcessor:
             logger.info(f"{order_name}: payment status is '{payment}', will check again next run")
             return "waiting"
 
+        # Training site on the order page: Code Blue CPR Services -> assign from the Code Blue account
+        self.current_order_name = order_name
+        site_elements = self.driver.find_elements(*EnrollNationwideOrderPage.training_site_name)
+        page_training_site = (site_elements[0].get_attribute("textContent") or "").strip() if site_elements else ""
+        order_site = order_data[0].get('training_site', '')
+        code_blue = (CODE_BLUE_SITE_TEXT in page_training_site.lower()
+                     or order_site.upper().startswith(CODE_BLUE_SITE_CODE))
+        if code_blue:
+            logger.info(f"{order_name}: Code Blue CPR Services order (training site '{page_training_site or order_site}')")
+
         name = order_data[0].get('name', '')
         training_site = order_data[0].get('training_site', '')
         logger.info(f"{order_name}: {name} - Training Site: {training_site or '-'}")
@@ -334,12 +449,16 @@ class OrderProcessor:
             if line_status != "done":
                 pending_lines.append((idx, key, order))
 
-        if not self.reserve_order_stock([order for _, _, order in pending_lines], order_name):
+        # Lines already moved to the Code Blue site in an earlier run don't need main-account stock
+        needs_main_stock = [order for _, key, order in pending_lines
+                            if self.ledger.item_status(order_id, key) != "transferred"]
+        if not self.reserve_order_stock(needs_main_stock, order_name):
             return "short"
 
         if DRY_RUN:
             for _, _, order in pending_lines:
-                logger.info(f"[DRY RUN] would assign {order['quantity']} x {order['product_code']} to {name}")
+                source = f" via {CODE_BLUE_ECARDS_SITE} and the Code Blue account" if code_blue else ""
+                logger.info(f"[DRY RUN] would assign {order['quantity']} x {order['product_code']} to {name}{source}")
                 self.stock_info[order['product_code']] = self.stock_info.get(order['product_code'], 0) - int(order['quantity'])
             logger.info(f"[DRY RUN] would mark {order_name} as Completed")
             return "dry-run"
@@ -349,7 +468,14 @@ class OrderProcessor:
             if not self.setup_eCards_session():
                 return "failed"
             for idx, key, order in pending_lines:
-                result = self.assign_line(order, training_site)
+                if self.ledger.item_status(order_id, key) == "transferred":
+                    result = self.assign_line_from_code_blue(order)
+                else:
+                    result = self.assign_line(order, training_site, code_blue)
+                if result == "transferred":
+                    self.ledger.mark_item(order_id, key, order['product_code'], int(order['quantity']), "transferred")
+                    logger.error(f"{order_name}: order left open; the Code Blue step will be retried next run")
+                    return "failed"
                 if result in ("done", "unverified"):
                     self.ledger.mark_item(order_id, key, order['product_code'], int(order['quantity']), result)
                 if result == "unverified":
