@@ -1,0 +1,28 @@
+$dir  = "D:\fiverr\Automation\Nathan_us\CodeBlueOrderAutomation"   # change if the project is elsewhere
+$task = "CodeBlue Order Automation"
+
+# 1. Stop the scheduled task
+Stop-ScheduledTask -TaskName $task
+
+# 2. Kill the restart loop together with everything it started (python, chromedriver, Chrome)
+Get-CimInstance Win32_Process -Filter "Name='cmd.exe'" |
+  Where-Object { $_.CommandLine -like "*start_automation.bat*" } |
+  ForEach-Object { taskkill /PID $_.ProcessId /T /F }
+
+# 3. Kill any Chrome windows still using this project's profile
+Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" |
+  Where-Object { $_.CommandLine -like "*$dir*" } |
+  ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+
+# 4. Check nothing from this project is left (should print nothing)
+Get-CimInstance Win32_Process |
+  Where-Object { $_.CommandLine -like "*$dir*" -or $_.CommandLine -like "*start_automation.bat*" } |
+  Select-Object ProcessId, Name
+
+
+
+
+Start-ScheduledTask -TaskName $task
+Start-Sleep 15
+Get-ScheduledTask -TaskName $task | Select-Object State
+Get-Content "$dir\logs\automation.log" -Tail 15
