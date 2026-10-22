@@ -84,6 +84,8 @@ class OrderProcessor:
         self.processed_orders = ProcessedOrders()
         self.skip_reason = ""   # why the last order was skipped (saved in processed_orders.json)
         self.current_order_name = ""
+        self.current_order_site = ""        # training site / instructor of the order being processed,
+        self.current_order_instructor = ""  # shown in the Discord stock message
         self.ecards_tab = None
         self.enw_tab = None
         self.results = {"completed": [], "skipped": [], "failed": [], "short": [], "review": [], "dry-run": [], "waiting": []}
@@ -215,7 +217,9 @@ class OrderProcessor:
                     "qty": quantity_needed - available_quantity,
                     "required_qty": quantity_needed,
                     "available_qty": available_quantity,
-                    "order_name": order_name
+                    "order_name": order_name,
+                    "training_site": self.current_order_site,
+                    "instructor": self.current_order_instructor,
                 })
 
         if shortages:
@@ -248,7 +252,9 @@ class OrderProcessor:
         if before_main < quantity:
             logger.error(f"Live stock for {product_code} is {before_main}, need {quantity}")
             quantity_required.append({"sku": product_code, "qty": quantity - before_main, "required_qty": quantity,
-                                      "available_qty": before_main, "order_name": self.current_order_name})
+                                      "available_qty": before_main, "order_name": self.current_order_name,
+                                      "training_site": self.current_order_site,
+                                      "instructor": self.current_order_instructor})
             return "failed"
 
         logger.info(f"Code Blue order: assigning {quantity} x {product_code} to {CODE_BLUE_ECARDS_SITE}, "
@@ -311,7 +317,9 @@ class OrderProcessor:
         if not ok and result.get("short"):
             quantity_required.append({"sku": f"{product_code} (Code Blue account)", "qty": quantity - before,
                                       "required_qty": quantity, "available_qty": before,
-                                      "order_name": self.current_order_name})
+                                      "order_name": self.current_order_name,
+                                      "training_site": self.current_order_site,
+                                      "instructor": self.current_order_instructor})
             return "failed"
         if not ok and not result.get("committed"):
             logger.error(f"✗ {product_code} was not assigned from the Code Blue account (stopped before Confirm)")
@@ -352,7 +360,9 @@ class OrderProcessor:
         if before < quantity:
             logger.error(f"Live stock for {product_code} is {before}, need {quantity}")
             quantity_required.append({"sku": product_code, "qty": quantity - before, "required_qty": quantity,
-                                      "available_qty": before, "order_name": self.current_order_name})
+                                      "available_qty": before, "order_name": self.current_order_name,
+                                      "training_site": self.current_order_site,
+                                      "instructor": self.current_order_instructor})
             return "failed"
 
         # Same assignment rules as before
@@ -423,6 +433,8 @@ class OrderProcessor:
 
         name = order_data[0].get('name', '')
         training_site = order_data[0].get('training_site', '')
+        self.current_order_site = training_site or page_training_site
+        self.current_order_instructor = name
         logger.info(f"{order_name}: {name} - Training Site: {training_site or '-'}")
         for i, order in enumerate(order_data, 1):
             logger.info(f"  {i}. {order.get('quantity')} {order.get('product_code') or '(no SKU)'} {order.get('course_name')}")

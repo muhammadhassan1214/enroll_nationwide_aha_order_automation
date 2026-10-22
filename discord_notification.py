@@ -32,7 +32,8 @@ class DiscordNotifier:
 def generate_stock_message(shortages: List[Dict[str, Any]], needs_review: Optional[List[str]] = None) -> Optional[str]:
     """
     Build the Discord message.
-    shortages: [{'sku', 'qty' (shortage), 'required_qty', 'available_qty', 'order_name'}, ...]
+    shortages: [{'sku', 'qty' (shortage), 'required_qty', 'available_qty', 'order_name',
+                 'training_site', 'instructor'}, ...]
     needs_review: orders where eCards may have issued cards that could not be confirmed.
     Returns None when there is nothing to report.
     """
@@ -41,22 +42,48 @@ def generate_stock_message(shortages: List[Dict[str, Any]], needs_review: Option
 
     lines: List[str] = []
     if shortages:
-        # Total to buy per SKU, plus which orders are waiting
-        totals: Dict[str, Dict[str, Any]] = {}
+        # One entry per order and product (same product twice in one order is added up)
+        entries: Dict[tuple, Dict[str, Any]] = {}
         for item in shortages:
-            entry = totals.setdefault(item["sku"], {"required": 0, "available": int(item.get("available_qty", 0)), "orders": []})
+            key = (item.get("order_name", ""), item["sku"])
+            entry = entries.setdefault(key, {
+                "sku": item["sku"], "order_name": item.get("order_name", ""), "required": 0,
+                "available": int(item.get("available_qty", 0)),
+                "training_site": item.get("training_site", ""), "instructor": item.get("instructor", ""),
+            })
             entry["required"] += int(item.get("required_qty", item["qty"]))
             entry["available"] = int(item.get("available_qty", entry["available"]))
-            order_name = item.get("order_name", "")
-            if order_name and order_name not in entry["orders"]:
-                entry["orders"].append(order_name)
 
-        lines.append("**You need to purchase the following eCards:**")
-        for sku in sorted(totals):
-            t = totals[sku]
-            to_buy = max(0, t["required"] - t["available"])
-            orders = f" ({', '.join(t['orders'])})" if t["orders"] else ""
-            lines.append(f"• **{sku}** – need {t['required']}, in stock {t['available']}, **buy {to_buy}**{orders}")
+        lines.append("You need to purchase the following eCards:")
+        for entry in entries.values():
+            to_buy = max(0, entry["required"] - entry["available"])
+            order = f" ({entry['order_name']})" if entry["order_name"] else ""
+            lines.append(f"• {entry['sku']} – need {entry['required']}, in stock {entry['available']}, buy {to_buy}{order}")
+            if entry["training_site"] or entry["instructor"]:
+                lines.append("Ordered by")
+                if entry["training_site"]:
+                    lines.append(f"_{entry['training_site']}_")
+                if entry["instructor"]:
+                    lines.append(entry["instructor"])
+            lines.append("")
+
+        # When the same product is short in several orders, show what to buy in total
+        totals: Dict[str, Dict[str, int]] = {}
+        for entry in entries.values():
+            t = totals.setdefault(entry["sku"], {"required": 0, "available": entry["available"], "orders": 0})
+            t["required"] += entry["required"]
+            t["available"] = entry["available"]
+            t["orders"] += 1
+        multi = {sku: t for sku, t in totals.items() if t["orders"] > 1}
+        if multi:
+            lines.append("Total to buy:")
+            for sku, t in multi.items():
+                lines.append(f"• {sku} – need {t['required']} across {t['orders']} orders, "
+                             f"in stock {t['available']}, buy {max(0, t['required'] - t['available'])}")
+            lines.append("")
+
+        while lines and lines[-1] == "":
+            lines.pop()
 
     if needs_review:
         if lines:
